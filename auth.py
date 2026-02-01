@@ -36,9 +36,41 @@ def audit(event_type, details=None):
             ),
         )
 
-def render_login():
-    st.header("🔐 Sign in")
+def render_superadmin_recovery():
+    if "SUPERADMIN_RECOVERY" not in st.secrets:
+        return False
+    if st.secrets.get("SUPERADMIN_RECOVERY") != "ENABLED":
+        return False
 
+    st.warning("⚠️ SuperAdmin Recovery Mode Enabled")
+    recovery_pw = st.text_input("Recovery password", type="password")
+    if st.button("Recover SuperAdmin"):
+        if recovery_pw != st.secrets.get("SUPERADMIN_RECOVERY_PASSWORD"):
+            st.error("Invalid recovery password")
+            return True
+
+        with db() as con:
+            r = con.execute("SELECT id FROM users WHERE role='superadmin' LIMIT 1").fetchone()
+            if r:
+                con.execute(
+                    "UPDATE users SET password_hash=? WHERE role='superadmin'",
+                    (pbkdf2_hash(recovery_pw),),
+                )
+            else:
+                con.execute(
+                    "INSERT INTO users (username,password_hash,role,created_at) VALUES (?,?,?,?)",
+                    ("superadmin", pbkdf2_hash(recovery_pw), "superadmin", now_iso()),
+                )
+        audit("superadmin_recovered", {})
+        st.success("SuperAdmin recovered. Please sign in with the recovery password.")
+        return True
+    return True
+
+def render_login():
+    if render_superadmin_recovery():
+        return
+
+    st.header("🔐 Sign in")
     with db() as con:
         cnt = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
