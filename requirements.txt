@@ -1,0 +1,25 @@
+# CUI Inspector & CMMC Data Flow Mapper - Dependencies
+# For AWS FedRAMP Cloud Environment
+
+streamlit>=1.28.0
+pandas>=2.0.0
+python-dateutil>=2.8.2
+
+# For enhanced document processing (optional)
+# Uncomment these for production deployment with full document support
+# PyPDF2>=3.0.0
+# python-docx>=1.0.0
+# openpyxl>=3.1.0
+# Pillow>=10.0.0
+
+# AWS SDK (for FedRAMP cloud integration)
+# boto3>=1.28.0
+# botocore>=1.31.0
+
+# Security and compliance
+# cryptography>=41.0.0
+# hashlib (built-in)
+
+# For enhanced reporting (optional)
+# reportlab>=4.0.0
+# matplotlib>=3.7.0
