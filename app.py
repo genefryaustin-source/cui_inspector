@@ -986,11 +986,6 @@ def render_audit_log():
     st.dataframe(df, use_container_width=True)
 
         # Auto-save QA run
-        if st.session_state.get('autosave_qa', True):
-            qa_findings = {'cui_detected': None, 'risk_level': 'QA', 'patterns_found': {}, 'cui_categories': [], 'summary': f"QA run on {len(df)} file(s)", 'recommendations': []}
-            qa_ins_id = save_inspection(None, run_type='qa', findings=qa_findings, started_at=_now_iso(), finished_at=_now_iso())
-            attach_evidence_file(qa_ins_id, 'qa_csv', 'qa_results.csv', df.to_csv(index=False).encode('utf-8'))
-            _audit('qa_run', {'inspection_id': qa_ins_id, 'count': int(len(df))})
 
     st.download_button("⬇️ Download audit log CSV", data=df.to_csv(index=False).encode("utf-8"),
                        file_name=f"audit_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
@@ -1077,6 +1072,20 @@ def render_search():
         df = search_index(q, risk=risk, limit=500)
         _audit("search", {"query": q, "risk": risk, "rows": int(len(df))})
         st.dataframe(df, use_container_width=True)
+
+        # Auto-save QA run
+        if st.session_state.get('autosave_qa', True):
+            qa_findings = {
+                'cui_detected': None,
+                'risk_level': 'QA',
+                'patterns_found': {},
+                'cui_categories': [],
+                'summary': f"QA run on {len(df)} file(s)",
+                'recommendations': [],
+            }
+            qa_ins_id = save_inspection(None, run_type='qa', findings=qa_findings, started_at=_now_iso(), finished_at=_now_iso())
+            attach_evidence_file(qa_ins_id, 'qa_csv', 'qa_results.csv', df.to_csv(index=False).encode('utf-8'))
+            _audit('qa_run', {'inspection_id': qa_ins_id, 'count': int(len(df))})
         st.download_button("⬇️ Download results CSV", data=df.to_csv(index=False).encode("utf-8"),
                            file_name=f"search_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
 
@@ -1107,6 +1116,20 @@ def render_verify_vault():
         df = verify_evidence_vault()
         _audit("verify_vault", {"rows": int(len(df))})
         st.dataframe(df, use_container_width=True)
+
+        # Auto-save QA run
+        if st.session_state.get('autosave_qa', True):
+            qa_findings = {
+                'cui_detected': None,
+                'risk_level': 'QA',
+                'patterns_found': {},
+                'cui_categories': [],
+                'summary': f"QA run on {len(df)} file(s)",
+                'recommendations': [],
+            }
+            qa_ins_id = save_inspection(None, run_type='qa', findings=qa_findings, started_at=_now_iso(), finished_at=_now_iso())
+            attach_evidence_file(qa_ins_id, 'qa_csv', 'qa_results.csv', df.to_csv(index=False).encode('utf-8'))
+            _audit('qa_run', {'inspection_id': qa_ins_id, 'count': int(len(df))})
         bad = df[df["status"] != "OK"]
         if len(bad) == 0:
             st.success("✅ All objects verified (OK).")
