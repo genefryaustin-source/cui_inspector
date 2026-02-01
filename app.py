@@ -31,6 +31,8 @@ import tempfile
 import os
 import zipfile
 import streamlit.components.v1 as components
+import sqlite3
+from pathlib import Path
 
 # Load configuration
 try:
@@ -521,6 +523,9 @@ def render_header():
 def render_cui_inspector():
     """Render CUI inspection interface"""
     st.header("📄 CUI Document Inspector")
+
+    autosave = st.toggle("Auto-save evidence to SQLite (recommended)", value=True)
+    uploaded_by = st.text_input("Uploaded/Run by (optional)", value="")
     st.info("""
     **Purpose:** Scan documents for Controlled Unclassified Information (CUI) to ensure proper handling per NIST SP 800-171.
     **Supported Formats:** PDF, Word (DOCX), Excel (XLSX), PowerPoint (PPTX), Text files (TXT, CSV, JSON, MD)
@@ -907,6 +912,344 @@ def render_cmmc_guidance():
         - Enable GuardDuty for threat detection
         """)
 
+
+# -----------------------------
+# Evidence Vault: SQLite DB + Repo (content-addressed) + Versioned uploads
+# -----------------------------
+APP_VERSION = "cui-portal-1.0"
+INSPECTOR_VERSION = "cui-inspector-1.0"
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+REPO_DIR = DATA_DIR / "repo"
+DB_PATH = DATA_DIR / "evidence.db"
+
+def _now_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+def _sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
+
+def _ensure_dirs():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (REPO_DIR / "objects").mkdir(parents=True, exist_ok=True)
+    (REPO_DIR / "refs").mkdir(parents=True, exist_ok=True)
+
+def _db():
+    _ensure_dirs()
+    con = sqlite3.connect(str(DB_PATH))
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON;")
+    return con
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS artifacts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  logical_name TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS artifact_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  artifact_id INTEGER NOT NULL,
+  version_int INTEGER NOT NULL,
+  original_filename TEXT NOT NULL,
+  object_relpath TEXT NOT NULL,
+  ref_relpath TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  mime TEXT,
+  created_at TEXT NOT NULL,
+  uploaded_by TEXT,
+  UNIQUE(artifact_id, version_int),
+  FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS inspections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  artifact_version_id INTEGER,
+  run_type TEXT NOT NULL,               -- single|bulk|qa
+  app_version TEXT NOT NULL,
+  inspector_version TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT NOT NULL,
+  cui_detected INTEGER,
+  risk_level TEXT,
+  patterns_json TEXT,
+  categories_json TEXT,
+  summary_json TEXT,
+  error TEXT,
+  FOREIGN KEY(artifact_version_id) REFERENCES artifact_versions(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS evidence_files (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  inspection_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                   -- findings_json|report_pdf|summary_csv|outputs_zip|qa_csv|certificate_pdf
+  object_relpath TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(inspection_id) REFERENCES inspections(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_inspections_started_at ON inspections(started_at);
+CREATE INDEX IF NOT EXISTS idx_artifact_versions_sha256 ON artifact_versions(sha256);
+CREATE INDEX IF NOT EXISTS idx_evidence_files_sha256 ON evidence_files(sha256);
+"""
+
+def init_evidence_store():
+    con = _db()
+    try:
+        con.executescript(SCHEMA_SQL)
+        con.commit()
+    finally:
+        con.close()
+
+def normalize_logical_name(filename: str) -> str:
+    # stable logical grouping (strip dirs, collapse whitespace, lower)
+    base = os.path.basename(filename or "document")
+    return re.sub(r"\s+", " ", base).strip().lower()
+
+def _object_path_for_hash(sha256: str) -> Path:
+    return REPO_DIR / "objects" / sha256[:2] / sha256
+
+def repo_store_object(data: bytes) -> str:
+    """
+    Store bytes in content-addressed object store if not present.
+    Returns relative path from REPO_DIR.
+    """
+    _ensure_dirs()
+    sha = _sha256_bytes(data)
+    obj_path = _object_path_for_hash(sha)
+    obj_path.parent.mkdir(parents=True, exist_ok=True)
+    if not obj_path.exists():
+        with open(obj_path, "wb") as f:
+            f.write(data)
+    rel = obj_path.relative_to(REPO_DIR).as_posix()
+    return rel
+
+def repo_write_ref(artifact_id: int, version_int: int, original_filename: str, data: bytes) -> str:
+    """
+    Write a human-friendly versioned copy under repo/refs for browsing.
+    Returns relative path from REPO_DIR.
+    """
+    _ensure_dirs()
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", os.path.basename(original_filename))
+    ref_dir = REPO_DIR / "refs" / f"artifact_{artifact_id}" / f"v{version_int:04d}"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    ref_path = ref_dir / safe_name
+    # Overwrite is fine; version folder is immutable by policy but file write is idempotent
+    with open(ref_path, "wb") as f:
+        f.write(data)
+    return ref_path.relative_to(REPO_DIR).as_posix()
+
+def upsert_artifact_and_version(filename: str, data: bytes, mime: str = None, uploaded_by: str = None) -> int:
+    """
+    Create/lookup artifact by logical name; add a new version if content differs from latest.
+    Returns artifact_version_id.
+    """
+    init_evidence_store()
+    logical = normalize_logical_name(filename)
+    sha = _sha256_bytes(data)
+    size = len(data)
+
+    con = _db()
+    try:
+        cur = con.cursor()
+        # ensure artifact row
+        cur.execute("SELECT id FROM artifacts WHERE logical_name = ?", (logical,))
+        row = cur.fetchone()
+        if row:
+            artifact_id = int(row["id"])
+        else:
+            cur.execute("INSERT INTO artifacts (logical_name, created_at) VALUES (?, ?)", (logical, _now_iso()))
+            artifact_id = cur.lastrowid
+
+        # check latest version hash
+        cur.execute("""
+            SELECT id, version_int, sha256 FROM artifact_versions
+            WHERE artifact_id = ?
+            ORDER BY version_int DESC
+            LIMIT 1
+        """, (artifact_id,))
+        last = cur.fetchone()
+        if last and last["sha256"] == sha:
+            return int(last["id"])  # no new version
+
+        next_ver = 1 if not last else int(last["version_int"]) + 1
+
+        obj_rel = repo_store_object(data)
+        ref_rel = repo_write_ref(artifact_id, next_ver, filename, data)
+
+        cur.execute("""
+            INSERT INTO artifact_versions
+            (artifact_id, version_int, original_filename, object_relpath, ref_relpath, sha256, size_bytes, mime, created_at, uploaded_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (artifact_id, next_ver, os.path.basename(filename), obj_rel, ref_rel, sha, size, mime, _now_iso(), uploaded_by))
+        av_id = cur.lastrowid
+        con.commit()
+        return int(av_id)
+    finally:
+        con.close()
+
+def save_inspection(artifact_version_id: int, run_type: str, findings: Dict, started_at: str, finished_at: str) -> int:
+    """
+    Persist inspection summary (not the full raw text) into SQLite.
+    Returns inspection_id.
+    """
+    init_evidence_store()
+    con = _db()
+    try:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO inspections
+            (artifact_version_id, run_type, app_version, inspector_version, started_at, finished_at,
+             cui_detected, risk_level, patterns_json, categories_json, summary_json, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            artifact_version_id,
+            run_type,
+            APP_VERSION,
+            INSPECTOR_VERSION,
+            started_at,
+            finished_at,
+            1 if findings.get("cui_detected") else 0 if findings.get("cui_detected") is not None else None,
+            findings.get("risk_level"),
+            json.dumps(findings.get("patterns_found", {})),
+            json.dumps(findings.get("cui_categories", [])),
+            json.dumps({
+                "filename": findings.get("filename"),
+                "risk_score": findings.get("risk_score"),
+                "summary": findings.get("summary"),
+                "recommendations_count": len(findings.get("recommendations", []) or []),
+            }),
+            findings.get("error")
+        ))
+        ins_id = cur.lastrowid
+        con.commit()
+        return int(ins_id)
+    finally:
+        con.close()
+
+def attach_evidence_file(inspection_id: int, kind: str, filename: str, data: bytes) -> int:
+    """
+    Store evidence output bytes into repo objects + record in db.
+    """
+    init_evidence_store()
+    obj_rel = repo_store_object(data)
+    sha = _sha256_bytes(data)
+    size = len(data)
+    con = _db()
+    try:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO evidence_files
+            (inspection_id, kind, object_relpath, filename, sha256, size_bytes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (inspection_id, kind, obj_rel, os.path.basename(filename), sha, size, _now_iso()))
+        eid = cur.lastrowid
+        con.commit()
+        return int(eid)
+    finally:
+        con.close()
+
+def repo_read_object(relpath: str) -> bytes:
+    p = REPO_DIR / relpath
+    with open(p, "rb") as f:
+        return f.read()
+
+def list_recent_inspections(limit: int = 50):
+    init_evidence_store()
+    con = _db()
+    try:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT i.id, i.run_type, i.started_at, i.finished_at, i.cui_detected, i.risk_level,
+                   av.original_filename, av.version_int, a.logical_name
+            FROM inspections i
+            LEFT JOIN artifact_versions av ON i.artifact_version_id = av.id
+            LEFT JOIN artifacts a ON av.artifact_id = a.id
+            ORDER BY i.started_at DESC
+            LIMIT ?
+        """, (limit,))
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        con.close()
+
+def list_evidence_files_for_inspection(inspection_id: int):
+    init_evidence_store()
+    con = _db()
+    try:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT id, kind, filename, object_relpath, sha256, size_bytes, created_at
+            FROM evidence_files
+            WHERE inspection_id = ?
+            ORDER BY created_at DESC
+        """, (inspection_id,))
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        con.close()
+
+def render_evidence_vault():
+    st.header("🗄️ Evidence Vault (SQLite + Repo + Versioning)")
+    st.caption("Every upload and inspection run is stored with hashes + timestamps. Use this page to browse, export, and retrieve evidence.")
+    init_evidence_store()
+
+    # quick stats
+    con = _db()
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(*) AS n FROM artifacts")
+        a_n = int(cur.fetchone()["n"])
+        cur.execute("SELECT COUNT(*) AS n FROM artifact_versions")
+        v_n = int(cur.fetchone()["n"])
+        cur.execute("SELECT COUNT(*) AS n FROM inspections")
+        i_n = int(cur.fetchone()["n"])
+        cur.execute("SELECT COUNT(*) AS n FROM evidence_files")
+        e_n = int(cur.fetchone()["n"])
+    finally:
+        con.close()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Artifacts", a_n)
+    c2.metric("Versions", v_n)
+    c3.metric("Inspections", i_n)
+    c4.metric("Evidence Files", e_n)
+
+    st.divider()
+    st.subheader("Recent inspections")
+    rows = list_recent_inspections(limit=100)
+    if not rows:
+        st.info("No inspections have been saved yet. Run the inspector or bulk runner to populate the vault.")
+        return
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True)
+
+    sel = st.selectbox("Select an inspection_id to view evidence files", options=[r["id"] for r in rows])
+    files = list_evidence_files_for_inspection(sel)
+    if files:
+        fdf = pd.DataFrame(files)
+        st.dataframe(fdf, use_container_width=True)
+
+        st.subheader("Download evidence files")
+        for f in files:
+            data = repo_read_object(f["object_relpath"])
+            st.download_button(
+                f'⬇️ {f["kind"]}: {f["filename"]} (sha256 {f["sha256"][:10]}...)',
+                data=data,
+                file_name=f["filename"],
+                mime="application/octet-stream"
+            )
+    else:
+        st.warning("No evidence files attached to this inspection yet.")
+
+
 # -----------------------------
 # Add-ons: Test Bundle + QA + Training + Mapping
 # -----------------------------
@@ -1096,6 +1439,20 @@ def render_test_bundle_runner():
             st.dataframe(df, use_container_width=True)
 
             # Downloads: consolidated CSV + zip of evidence
+                        if st.session_state.get('autosave_bulk', True):
+                # Save a bulk run inspection record (no single artifact_version_id)
+                bulk_findings = {
+                    'cui_detected': None,
+                    'risk_level': 'BULK',
+                    'patterns_found': {},
+                    'cui_categories': [],
+                    'risk_score': None,
+                    'summary': f"Bulk run on {len(results)} artifacts",
+                    'recommendations': [],
+                }
+                bulk_ins_id = save_inspection(None, run_type='bulk', findings=bulk_findings, started_at=_now_iso(), finished_at=_now_iso())
+                attach_evidence_file(bulk_ins_id, 'summary_csv', 'bulk_summary.csv', df.to_csv(index=False).encode('utf-8'))
+            
             st.download_button(
                 "⬇️ Download Summary CSV",
                 data=df.to_csv(index=False).encode("utf-8"),
@@ -1104,6 +1461,12 @@ def render_test_bundle_runner():
             )
 
             bundle_zip = _zip_bytes({**json_reports, **pdf_reports})
+            if st.session_state.get('autosave_bulk', True):
+                try:
+                    attach_evidence_file(bulk_ins_id, 'outputs_zip', 'bulk_outputs.zip', bundle_zip)
+                except Exception:
+                    pass
+
             st.download_button(
                 "⬇️ Download Bulk Run Outputs (ZIP)",
                 data=bundle_zip,
@@ -1273,6 +1636,7 @@ def main():
              "📑 CUI Marking QA",
              "🧩 CMMC L2 Mapping Explorer",
              "🎓 Training + Certificate",
+             "🗄️ Evidence Vault",
              "📚 CMMC Guidance"],
             label_visibility="collapsed"
         )
@@ -1308,6 +1672,8 @@ def main():
         render_cmmc_mapping_explorer()
     elif page == "🎓 Training + Certificate":
         render_training_and_certificate()
+    elif page == "🗄️ Evidence Vault":
+        render_evidence_vault()
     else:
         render_cmmc_guidance()
     
