@@ -1,7 +1,7 @@
 
 import streamlit as st
 import hashlib, os
-from db import db, now_iso
+from db import db
 
 REPO = "data/repo"
 os.makedirs(REPO, exist_ok=True)
@@ -18,12 +18,9 @@ def render_manifest():
     st.header("📦 Evidence Manifest")
     with db() as con:
         rows = con.execute(
-            "SELECT a.logical_name, av.sha256 AS artifact_hash, ef.sha256 AS evidence_hash "
-            "FROM artifacts a "
-            "LEFT JOIN artifact_versions av ON av.artifact_id=a.id "
-            "LEFT JOIN evidence_files ef ON ef.inspection_id=av.id"
+            "SELECT username, event_type, created_at FROM audit_events ORDER BY created_at DESC"
         ).fetchall()
-    csv = "logical_name,artifact_hash,evidence_hash\n"
+    csv = "username,event_type,created_at\n"
     for r in rows:
-        csv += f"{r['logical_name']},{r['artifact_hash']},{r['evidence_hash']}\n"
+        csv += f"{r['username'] if 'username' in r.keys() else ''},{r['event_type']},{r['created_at']}\n"
     st.download_button("Download manifest.csv", csv.encode(), "manifest.csv")

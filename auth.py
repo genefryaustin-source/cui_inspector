@@ -1,7 +1,6 @@
 
 import streamlit as st
-import hashlib, secrets
-from datetime import datetime
+import hashlib, secrets, json
 from db import db, now_iso
 
 def pbkdf2_hash(password: str, iters: int = 200_000) -> str:
@@ -37,73 +36,34 @@ def audit(event_type, details=None):
             ),
         )
 
-def render_superadmin_recovery():
-    import os
-
-    if os.getenv("SUPERADMIN_RECOVERY") != "ENABLED":
-        return False
-
-    st.warning("⚠️ SuperAdmin Recovery Mode Enabled")
-
-    pw = st.text_input("Recovery password", type="password")
-    if st.button("Recover SuperAdmin"):
-        if pw != os.getenv("SUPERADMIN_RECOVERY_PASSWORD"):
-            st.error("Invalid recovery password")
-            return True
-
-        from db import db, now_iso
-
-        with db() as con:
-            r = con.execute(
-                "SELECT id FROM users WHERE role='superadmin' LIMIT 1"
-            ).fetchone()
-
-            if not r:
-                con.execute(
-                    "INSERT INTO users (username,password_hash,role,created_at) VALUES (?,?,?,?)",
-                    ("superadmin", pbkdf2_hash(pw), "superadmin", now_iso()),
-                )
-            else:
-                con.execute(
-                    "UPDATE users SET password_hash=? WHERE role='superadmin'",
-                    (pbkdf2_hash(pw),),
-                )
-
-        st.success("SuperAdmin recovered. Please sign in.")
-        return True
-
-    return True
-if render_superadmin_recovery():
-    return
-
-
 def render_login():
     st.header("🔐 Sign in")
+
     with db() as con:
         cnt = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
     if cnt == 0:
         st.warning("Bootstrap SuperAdmin")
-        u = st.text_input("Username", "superadmin")
-        p = st.text_input("Password", type="password")
+        username = st.text_input("Username", "superadmin").strip().lower()
+        password = st.text_input("Password", type="password")
         if st.button("Create SuperAdmin"):
             with db() as con:
                 con.execute(
                     "INSERT INTO users (username,password_hash,role,created_at) VALUES (?,?,?,?)",
-                    (u, pbkdf2_hash(p), "superadmin", now_iso()),
+                    (username, pbkdf2_hash(password), "superadmin", now_iso()),
                 )
-            st.success("Created. Reload.")
+            st.success("SuperAdmin created. Reload the app.")
         return
 
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
+    username = st.text_input("Username").strip().lower()
+    password = st.text_input("Password", type="password")
     if st.button("Sign in"):
         with db() as con:
             r = con.execute(
                 "SELECT id,username,password_hash,role,tenant_id FROM users WHERE username=? AND is_active=1",
-                (u,),
+                (username,),
             ).fetchone()
-        if not r or not pbkdf2_verify(p, r[2]):
+        if not r or not pbkdf2_verify(password, r[2]):
             st.error("Invalid credentials")
             return
         st.session_state["auth_user"] = {
@@ -113,12 +73,14 @@ def render_login():
             "tenant_id": r[4],
         }
         st.session_state["tenant_id"] = r[4]
+        audit("login_success", {"username": r[1], "role": r[3]})
         st.success("Signed in")
         st.rerun()
 
 def render_logout():
     if current_user():
-        st.sidebar.markdown(f"**{current_user()['username']}**")
+        st.sidebar.markdown(f"**User:** {current_user()['username']} ({current_user()['role']})")
         if st.sidebar.button("Logout"):
+            audit("logout", {"username": current_user()["username"]})
             st.session_state.clear()
             st.rerun()

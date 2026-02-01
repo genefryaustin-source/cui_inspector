@@ -30,33 +30,6 @@ CREATE TABLE IF NOT EXISTS audit_events (
   details_json TEXT,
   created_at TEXT
 );
-CREATE TABLE IF NOT EXISTS artifacts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  tenant_id INTEGER,
-  logical_name TEXT,
-  created_at TEXT
-);
-CREATE TABLE IF NOT EXISTS artifact_versions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  artifact_id INTEGER,
-  sha256 TEXT,
-  object_path TEXT,
-  created_at TEXT
-);
-CREATE TABLE IF NOT EXISTS inspections (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  tenant_id INTEGER,
-  run_type TEXT,
-  started_at TEXT,
-  finished_at TEXT
-);
-CREATE TABLE IF NOT EXISTS evidence_files (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  inspection_id INTEGER,
-  sha256 TEXT,
-  object_path TEXT,
-  created_at TEXT
-);
 '''
 
 def now_iso():
