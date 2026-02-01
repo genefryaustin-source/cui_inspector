@@ -10,7 +10,7 @@ def pbkdf2_hash(password: str, iters: int = 200_000) -> str:
 
 def pbkdf2_verify(password: str, stored: str) -> bool:
     try:
-        algo, iters, salt, hexhash = stored.split("$", 3)
+        _, iters, salt, hexhash = stored.split("$", 3)
         dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), int(iters))
         return dk.hex() == hexhash
     except Exception:
@@ -37,17 +37,17 @@ def audit(event_type, details=None):
         )
 
 def render_superadmin_recovery():
-    if "SUPERADMIN_RECOVERY" not in st.secrets:
-        return False
+    # Only show recovery UI if explicitly enabled
     if st.secrets.get("SUPERADMIN_RECOVERY") != "ENABLED":
         return False
 
     st.warning("⚠️ SuperAdmin Recovery Mode Enabled")
+
     recovery_pw = st.text_input("Recovery password", type="password")
     if st.button("Recover SuperAdmin"):
         if recovery_pw != st.secrets.get("SUPERADMIN_RECOVERY_PASSWORD"):
             st.error("Invalid recovery password")
-            return True
+            st.stop()
 
         with db() as con:
             r = con.execute("SELECT id FROM users WHERE role='superadmin' LIMIT 1").fetchone()
@@ -61,16 +61,20 @@ def render_superadmin_recovery():
                     "INSERT INTO users (username,password_hash,role,created_at) VALUES (?,?,?,?)",
                     ("superadmin", pbkdf2_hash(recovery_pw), "superadmin", now_iso()),
                 )
+
         audit("superadmin_recovered", {})
-        st.success("SuperAdmin recovered. Please sign in with the recovery password.")
-        return True
-    return True
+        st.success("SuperAdmin recovered. Disable recovery secrets and reload.")
+        st.stop()
+
+    # IMPORTANT: allow normal login to render underneath
+    return False
 
 def render_login():
-    if render_superadmin_recovery():
-        return
+    # Show recovery banner if enabled, but do not block login
+    render_superadmin_recovery()
 
     st.header("🔐 Sign in")
+
     with db() as con:
         cnt = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
@@ -85,6 +89,7 @@ def render_login():
                     (username, pbkdf2_hash(password), "superadmin", now_iso()),
                 )
             st.success("SuperAdmin created. Reload the app.")
+            st.stop()
         return
 
     username = st.text_input("Username").strip().lower()
@@ -97,7 +102,8 @@ def render_login():
             ).fetchone()
         if not r or not pbkdf2_verify(password, r[2]):
             st.error("Invalid credentials")
-            return
+            st.stop()
+
         st.session_state["auth_user"] = {
             "id": r[0],
             "username": r[1],
