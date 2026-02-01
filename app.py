@@ -583,8 +583,7 @@ class DataFlowMapper:
         return json.dumps(export_data, indent=2)
 
 
-def render_header()
-
+def render_header():
     if not _require_login():
         render_login()
         return:
