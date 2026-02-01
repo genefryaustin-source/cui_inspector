@@ -29,6 +29,8 @@ from PIL import Image
 import pdf2image
 import tempfile
 import os
+import zipfile
+import streamlit.components.v1 as components
 
 # Load configuration
 try:
@@ -905,6 +907,353 @@ def render_cmmc_guidance():
         - Enable GuardDuty for threat detection
         """)
 
+# -----------------------------
+# Add-ons: Test Bundle + QA + Training + Mapping
+# -----------------------------
+
+BUNDLE_PATH = os.path.join(os.path.dirname(__file__), "CUI_Full_Test_Bundle.zip")
+SAMPLE_DOCS = {
+    "CUI_Mismarked.docx": "CUI_Mismarked.docx",
+    "Mixed_CUI_NonCUI.docx": "Mixed_CUI_NonCUI.docx",
+    "CUI_Handling_SOP.docx": "CUI_Handling_SOP.docx",
+    "CUI_CMMC_L2_Mapping.xlsx": "CUI_CMMC_L2_Mapping.xlsx",
+    "CUI_Training_Slides.pdf": "CUI_Training_Slides.pdf",
+}
+
+def _local_sample_path(filename: str) -> str:
+    return os.path.join(os.path.dirname(__file__), filename)
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+def _zip_bytes(file_map: Dict[str, bytes]) -> bytes:
+    """Return a zip as bytes from {name: data}"""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in file_map.items():
+            z.writestr(name, data)
+    buf.seek(0)
+    return buf.read()
+
+def _render_pdf_inline(pdf_bytes: bytes, height: int = 800):
+    """Embed PDF in Streamlit via base64 iframe."""
+    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    html = f"""
+    <iframe src="data:application/pdf;base64,{b64}" width="100%" height="{height}" type="application/pdf"></iframe>
+    """
+    st.components.v1.html(html, height=height, scrolling=True)
+
+def _generate_training_certificate_pdf(name: str, score: int, total: int) -> bytes:
+    """Generate a simple completion certificate PDF."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    w, h = letter
+
+    # Border
+    c.setStrokeColor(colors.HexColor("#1f77b4"))
+    c.setLineWidth(3)
+    c.rect(0.6*inch, 0.6*inch, w-1.2*inch, h-1.2*inch)
+
+    c.setFont("Helvetica-Bold", 24)
+    c.drawCentredString(w/2, h-1.5*inch, "Certificate of Completion")
+
+    c.setFont("Helvetica", 12)
+    c.drawCentredString(w/2, h-2.1*inch, "CUI Handling & Marking Training")
+
+    c.setFont("Helvetica-Bold", 18)
+    c.drawCentredString(w/2, h-3.0*inch, name.strip() if name.strip() else "Participant")
+
+    c.setFont("Helvetica", 12)
+    c.drawCentredString(w/2, h-3.6*inch, f"Score: {score}/{total}")
+
+    c.setFont("Helvetica", 11)
+    c.drawCentredString(w/2, h-4.2*inch, "This certificate acknowledges successful completion of the training module.")
+
+    c.setFont("Helvetica-Oblique", 10)
+    issued = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.drawString(0.9*inch, 0.9*inch, f"Issued: {issued}")
+    c.drawRightString(w-0.9*inch, 0.9*inch, "Authorized Signature: ____________________")
+
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
+def _mismarking_checks(text: str) -> Dict[str, any]:
+    """
+    Lightweight QA for potential CUI marking issues.
+    Rules (heuristic):
+      - If CUI indicators (PII/Export/Contract/etc) are found but no explicit CUI marking -> possible UNDER-marked.
+      - If explicit CUI marking appears but no other indicators -> possible OVER-marked.
+      - Look for mixture: 'CUI' + 'Public' or 'Unclassified' in same doc -> conflicting marking.
+    """
+    indicators = {}
+    for k, pattern in CUI_PATTERNS.items():
+        indicators[k] = len(re.findall(pattern, text, re.IGNORECASE))
+
+    explicit = indicators.get("CUI_MARKING", 0) > 0
+    substantive = sum(v for k, v in indicators.items() if k != "CUI_MARKING") > 0
+
+    flags = []
+    if substantive and not explicit:
+        flags.append("Possible UNDER-marked: indicators found but no explicit CUI marking.")
+    if explicit and not substantive:
+        flags.append("Possible OVER-marked: explicit CUI marking present with few/no indicators detected.")
+    if re.search(r"\b(PUBLIC|UNCLASSIFIED)\b", text, re.IGNORECASE) and explicit:
+        flags.append("Conflicting marking: 'CUI' appears alongside PUBLIC/UNCLASSIFIED language.")
+
+    return {
+        "explicit_cui_marking": explicit,
+        "indicator_counts": indicators,
+        "flags": flags
+    }
+
+def render_test_bundle_runner():
+    st.header("🧪 Test Bundle Runner")
+    st.info("""
+    **Purpose:** Quickly validate your CUI inspection + evidence workflows using a packaged test bundle.
+    - Run bulk inspection against the included sample docs
+    - Export consolidated CSV/JSON + per-file PDF reports
+    - Download the full bundle for third‑party assessor testing
+    """)
+
+    # Bundle download
+    if os.path.exists(BUNDLE_PATH):
+        st.download_button(
+            "⬇️ Download Full Test Bundle (ZIP)",
+            data=_read_bytes(BUNDLE_PATH),
+            file_name="CUI_Full_Test_Bundle.zip",
+            mime="application/zip"
+        )
+
+    # Show sample docs downloads
+    st.subheader("📦 Included sample artifacts")
+    cols = st.columns(3)
+    i = 0
+    for label, filename in SAMPLE_DOCS.items():
+        p = _local_sample_path(filename)
+        if os.path.exists(p):
+            with cols[i % 3]:
+                st.download_button(
+                    f"⬇️ {label}",
+                    data=_read_bytes(p),
+                    file_name=label,
+                    mime="application/octet-stream"
+                )
+        i += 1
+
+    st.divider()
+    st.subheader("🚀 Run bulk inspection on included docs")
+    inspector = CUIInspector()
+
+    if st.button("Run on included docs", type="primary"):
+        results = []
+        pdf_reports = {}
+        json_reports = {}
+
+        for label, filename in SAMPLE_DOCS.items():
+            p = _local_sample_path(filename)
+            if not os.path.exists(p):
+                continue
+            # For PDFs/DOCX/XLSX we can open as bytes and pass BytesIO into inspector
+            data = _read_bytes(p)
+            bio = BytesIO(data)
+            findings = inspector.inspect_file(bio, label)
+            results.append(findings)
+            json_reports[f"{label}.json"] = json.dumps(findings, indent=2).encode("utf-8")
+
+            # PDF report (skip if error)
+            if findings.get("risk_level") != "ERROR":
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                        inspector.generate_cui_report_pdf(findings, tmp_pdf.name)
+                        with open(tmp_pdf.name, "rb") as f:
+                            pdf_reports[f"reports/{label}.pdf"] = f.read()
+                    os.unlink(tmp_pdf.name)
+                except Exception as e:
+                    pass
+
+        if results:
+            st.success(f"Completed bulk run on {len(results)} artifact(s).")
+            # Summary dataframe
+            summary = []
+            for r in results:
+                summary.append({
+                    "filename": r.get("filename"),
+                    "cui_detected": r.get("cui_detected"),
+                    "risk_level": r.get("risk_level"),
+                    "patterns_total": sum(r.get("patterns_found", {}).values()),
+                    "categories": "; ".join(sorted(set(r.get("cui_categories", [])))),
+                    "error": r.get("error", "")
+                })
+            df = pd.DataFrame(summary)
+            st.dataframe(df, use_container_width=True)
+
+            # Downloads: consolidated CSV + zip of evidence
+            st.download_button(
+                "⬇️ Download Summary CSV",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name=f"cui_bulk_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+
+            bundle_zip = _zip_bytes({**json_reports, **pdf_reports})
+            st.download_button(
+                "⬇️ Download Bulk Run Outputs (ZIP)",
+                data=bundle_zip,
+                file_name=f"cui_bulk_outputs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip"
+            )
+
+def render_cui_marking_qa():
+    st.header("📑 CUI Marking QA (Under/Over/Conflicting)")
+    st.info("""
+    **Purpose:** Spot likely marking mistakes in documents:
+    - **Under‑marked:** indicators present without explicit CUI marking
+    - **Over‑marked:** explicit CUI marking with no indicators
+    - **Conflicting:** CUI appears alongside PUBLIC/UNCLASSIFIED wording
+
+    This is heuristic QA intended for workflow testing.
+    """)
+
+    inspector = CUIInspector()
+    uploaded = st.file_uploader(
+        "Upload document(s) for marking QA",
+        accept_multiple_files=True,
+        type=['txt','csv','json','md','pdf','docx','doc','xlsx','xls','pptx','ppt']
+    )
+
+    if st.button("Run marking QA"):
+        if not uploaded:
+            st.warning("Upload at least one file.")
+            return
+
+        outputs = []
+        for f in uploaded:
+            # Extract text using inspector's extractor
+            try:
+                bio = BytesIO(f.read())
+                # Need filename for filetype routing; reuse inspector internals
+                text = inspector.extract_text_from_file(bio, f.name)
+                qa = _mismarking_checks(text)
+                outputs.append({
+                    "filename": f.name,
+                    "explicit_cui_marking": qa["explicit_cui_marking"],
+                    "flags": " | ".join(qa["flags"]) if qa["flags"] else "",
+                    **{k: v for k, v in qa["indicator_counts"].items()}
+                })
+            except Exception as e:
+                outputs.append({"filename": f.name, "error": str(e)})
+
+        df = pd.DataFrame(outputs)
+        st.dataframe(df, use_container_width=True)
+
+        st.download_button(
+            "⬇️ Download QA Results (CSV)",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name=f"cui_marking_qa_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+
+def render_cmmc_mapping_explorer():
+    st.header("🧩 CMMC Level 2 Mapping Explorer")
+    st.info("""
+    **Purpose:** Browse and filter the provided CUI ↔ CMMC L2 mapping sheet.
+    Use this to trace findings/recommendations back to practices for evidence packaging.
+    """)
+    p = _local_sample_path("CUI_CMMC_L2_Mapping.xlsx")
+    if not os.path.exists(p):
+        st.error("Mapping file not found next to app.py")
+        return
+
+    wb = openpyxl.load_workbook(p)
+    sheet = wb[wb.sheetnames[0]]
+    rows = list(sheet.iter_rows(values_only=True))
+    header = [str(h) if h is not None else "" for h in rows[0]]
+    data = rows[1:]
+    df = pd.DataFrame(data, columns=header)
+
+    # Simple filter widgets (best-effort since column names can vary)
+    st.caption("Tip: If your sheet uses different column names, the free-text search will still work.")
+    q = st.text_input("Search (any column)", "")
+    if q.strip():
+        mask = df.apply(lambda row: row.astype(str).str.contains(q, case=False, na=False).any(), axis=1)
+        df_view = df[mask].copy()
+    else:
+        df_view = df
+
+    st.dataframe(df_view, use_container_width=True)
+
+    st.download_button(
+        "⬇️ Download Filtered Mapping (CSV)",
+        data=df_view.to_csv(index=False).encode("utf-8"),
+        file_name=f"cmmc_l2_mapping_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv"
+    )
+
+    st.download_button(
+        "⬇️ Download Original Mapping (XLSX)",
+        data=_read_bytes(p),
+        file_name="CUI_CMMC_L2_Mapping.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+def render_training_and_certificate():
+    st.header("🎓 Training + Certificate")
+    st.info("""
+    **Purpose:** Provide auditor-friendly evidence of workforce training completion for CUI handling/marking.
+    - View the training slides
+    - Complete a short quiz
+    - Generate a completion certificate PDF
+    """)
+
+    slides_path = _local_sample_path("CUI_Training_Slides.pdf")
+    if os.path.exists(slides_path):
+        st.subheader("📚 Training Slides")
+        pdf_bytes = _read_bytes(slides_path)
+        with st.expander("View slides inline", expanded=False):
+            _render_pdf_inline(pdf_bytes, height=900)
+        st.download_button("⬇️ Download Slides (PDF)", data=pdf_bytes, file_name="CUI_Training_Slides.pdf", mime="application/pdf")
+
+    st.subheader("📝 Quick Quiz")
+    name = st.text_input("Participant name (for certificate)", "")
+
+    # Simple quiz (keep deterministic)
+    questions = [
+        ("CUI should be protected according to contract, law, and policy requirements.", ["True", "False"], 0),
+        ("If a document contains CUI indicators but lacks any CUI marking, it may be:", ["Over-marked", "Under-marked", "Correctly marked"], 1),
+        ("For CUI in transit, recommended minimum is:", ["TLS 1.2+", "HTTP", "Telnet"], 0),
+        ("Audit logs are relevant evidence for which CMMC domain in this app’s recommendations?", ["AU", "PE", "MA"], 0),
+        ("If 'CUI' and 'PUBLIC' appear together, that is best described as:", ["Conflicting marking", "Encryption issue", "Normal"], 0),
+    ]
+
+    answers = []
+    for idx, (q, opts, correct) in enumerate(questions, 1):
+        ans = st.radio(f"{idx}. {q}", opts, index=0, key=f"quiz_{idx}")
+        answers.append((ans, opts[correct]))
+
+    if st.button("Grade quiz & generate certificate", type="primary"):
+        score = sum(1 for (a, c) in answers if a == c)
+        total = len(questions)
+        if score == total:
+            st.success(f"✅ Passed! Score: {score}/{total}")
+        else:
+            st.warning(f"⚠️ Score: {score}/{total} (You can retry; certificate still available for workflow testing.)")
+
+        cert = _generate_training_certificate_pdf(name or "Participant", score, total)
+        st.download_button(
+            "⬇️ Download Certificate (PDF)",
+            data=cert,
+            file_name=f"CUI_Training_Certificate_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+            mime="application/pdf"
+        )
+
 
 def main():
     """Main application function"""
@@ -920,6 +1269,10 @@ def main():
             "Select Function",
             ["📄 CUI Document Inspector",
              "🗺️ Data Flow Mapper",
+             "🧪 Test Bundle Runner",
+             "📑 CUI Marking QA",
+             "🧩 CMMC L2 Mapping Explorer",
+             "🎓 Training + Certificate",
              "📚 CMMC Guidance"],
             label_visibility="collapsed"
         )
@@ -947,6 +1300,14 @@ def main():
         render_cui_inspector()
     elif page == "🗺️ Data Flow Mapper":
         render_data_flow_mapper()
+    elif page == "🧪 Test Bundle Runner":
+        render_test_bundle_runner()
+    elif page == "📑 CUI Marking QA":
+        render_cui_marking_qa()
+    elif page == "🧩 CMMC L2 Mapping Explorer":
+        render_cmmc_mapping_explorer()
+    elif page == "🎓 Training + Certificate":
+        render_training_and_certificate()
     else:
         render_cmmc_guidance()
     
