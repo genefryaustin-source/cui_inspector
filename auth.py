@@ -41,29 +41,25 @@ def is_auditor() -> bool:
 def can_cross_tenant() -> bool:
     return is_superadmin() or is_auditor()
 
-def require_role(*roles):
-    if role() not in roles:
-        st.error("Insufficient permissions.")
-        st.stop()
-
 def tenant_id():
     return st.session_state.get("tenant_id")
 
 def set_tenant_id(tid):
     st.session_state["tenant_id"] = tid
 
-def audit(event_type: str, details: dict | None = None):
+def audit(event_type: str, details=None):
+    details = details or {}
     u = current_user()
     with db() as con:
         con.execute(
             "INSERT INTO audit_events (tenant_id, user_id, event_type, details_json, created_at) VALUES (?,?,?,?,?)",
-            (tenant_id(), u["id"] if u else None, event_type, json.dumps(details or {}), now_iso()),
+            (tenant_id(), u["id"] if u else None, event_type, json.dumps(details), now_iso()),
         )
 
 def render_superadmin_recovery_banner():
+    # Optional break-glass via Streamlit secrets (disable after use)
     if st.secrets.get("SUPERADMIN_RECOVERY") != "ENABLED":
         return
-
     st.warning("⚠️ SuperAdmin Recovery Mode Enabled (disable after use)")
     pw = st.text_input("Recovery password", type="password", key="recovery_pw")
     if st.button("Recover SuperAdmin", key="recover_btn"):
@@ -96,7 +92,7 @@ def render_login():
         password = st.text_input("SuperAdmin password", type="password")
         confirm = st.text_input("Confirm password", type="password")
         if st.button("Create SuperAdmin"):
-            if not username or not password or password != confirm:
+            if (not username) or (not password) or (password != confirm):
                 st.error("Provide a username and matching passwords.")
                 st.stop()
             with db() as con:
@@ -116,20 +112,28 @@ def render_login():
                 "SELECT id, tenant_id, username, password_hash, role, is_active FROM users WHERE username=?",
                 (username,),
             ).fetchone()
-            if not r or int(r["is_active"]) != 1 or not pbkdf2_verify(password, r["password_hash"]):
+            if (not r) or int(r["is_active"]) != 1 or (not pbkdf2_verify(password, r["password_hash"])):
                 st.error("Invalid credentials")
                 st.stop()
-            con.execute("UPDATE users SET last_login_at=? WHERE id=?", (now_iso(), int(r["id"])))
+
+            # last_login_at may not exist in legacy DBs; db.init_db() migrates it, but keep safe anyway
+            try:
+                con.execute("UPDATE users SET last_login_at=? WHERE id=?", (now_iso(), int(r["id"])))
+            except Exception:
+                pass
+
         st.session_state["auth_user"] = {
             "id": int(r["id"]),
             "username": r["username"],
             "role": r["role"],
             "tenant_id": (int(r["tenant_id"]) if r["tenant_id"] is not None else None),
         }
+
         if can_cross_tenant():
             set_tenant_id(None)
         else:
             set_tenant_id(int(r["tenant_id"]) if r["tenant_id"] is not None else None)
+
         audit("login_success", {"username": r["username"], "role": r["role"]})
         st.success("Signed in")
         st.rerun()

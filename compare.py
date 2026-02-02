@@ -22,7 +22,12 @@ def _load_inspection(con, ins_id: int):
 
 def _delta_dict(a: dict, b: dict):
     keys = set(a.keys()) | set(b.keys())
-    return [{"key": k, "a": int(a.get(k, 0)), "b": int(b.get(k, 0)), "delta": int(b.get(k, 0)) - int(a.get(k, 0))} for k in sorted(keys)]
+    out = []
+    for k in sorted(keys):
+        av = int(a.get(k, 0))
+        bv = int(b.get(k, 0))
+        out.append({"key": k, "a": av, "b": bv, "delta": bv - av})
+    return out
 
 def render_compare():
     st.header("🧾 Compare Runs (N vs N-1)")

@@ -27,7 +27,7 @@ def render_user_management():
         submitted = st.form_submit_button("Create user")
 
     if submitted:
-        if not username or not password:
+        if (not username) or (not password):
             st.error("Username and password required.")
             st.stop()
 

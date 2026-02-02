@@ -167,7 +167,7 @@ def render_inspector():
         return
 
     if is_auditor():
-        st.info("Auditor role: intended for review/verification. (Write actions can be restricted further.)")
+        st.info("Auditor role: intended for review/verification.")
 
     uploaded = st.file_uploader("Upload a document (PDF/DOCX/TXT)", type=["pdf", "docx", "txt"])
     store_index = st.toggle("Store safe excerpt for search", value=True)
