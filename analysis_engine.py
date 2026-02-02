@@ -1,9 +1,9 @@
 import re
-from typing import Dict, Any
 from utils import clamp
 from rulesets import RULESETS
 
-def analyze_text(text: str, ruleset_name: str) -> Dict[str, Any]:
+
+def analyze_text(text: str, ruleset_name: str):
     rs = RULESETS[ruleset_name]
     t = text or ""
     tlow = t.lower()
@@ -29,6 +29,7 @@ def analyze_text(text: str, ruleset_name: str) -> Dict[str, Any]:
         + sum(sens_hits.values()) * rs["weights"]["sensitive"]
         + len(kw_hits) * rs["weights"]["keyword"]
     )
+
     if len(cui_hits) >= 2:
         score += rs["weights"]["multi_bonus"]
 

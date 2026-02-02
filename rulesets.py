@@ -1,7 +1,4 @@
-from typing import Dict, Any, List
-
-# Email is sensitive (NOT CUI) per your instruction.
-RULESETS: Dict[str, Dict[str, Any]] = {
+RULESETS = {
     "Basic": {
         "description": "Balanced detection. Email is sensitive, not CUI.",
         "cui_patterns": {
@@ -29,5 +26,7 @@ RULESETS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-def ruleset_names() -> List[str]:
+
+def ruleset_names():
     return list(RULESETS.keys())
+

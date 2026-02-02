@@ -1,17 +1,15 @@
-from typing import List
 import streamlit as st
 
-# Optional OCR dependencies (Cloud-safe)
 OCR_AVAILABLE = True
 
 try:
-    import pytesseract  # type: ignore
+    import pytesseract
 except Exception:
     pytesseract = None
     OCR_AVAILABLE = False
 
 try:
-    import pdf2image  # type: ignore
+    import pdf2image
 except Exception:
     pdf2image = None
     OCR_AVAILABLE = False
@@ -28,28 +26,17 @@ if pytesseract and TESSERACT_CMD:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 
-def extract_text_from_pdf(uploaded_file) -> str:
+def extract_text_from_pdf(uploaded_file):
     from PyPDF2 import PdfReader
-
     reader = PdfReader(uploaded_file)
-    text_parts: List[str] = []
-    for pg in reader.pages:
-        t = pg.extract_text() or ""
-        if t:
-            text_parts.append(t)
+    text = "\n".join(pg.extract_text() or "" for pg in reader.pages)
 
-    text = "\n".join(text_parts)
-
-    if not text.strip():
-        if not OCR_AVAILABLE:
-            st.warning("⚠️ PDF appears scanned but OCR is unavailable.")
-            return ""
-
+    if not text.strip() and OCR_AVAILABLE:
         try:
             images = pdf2image.convert_from_bytes(
                 uploaded_file.getvalue(),
                 dpi=OCR_DPI,
-                poppler_path=POPPLER_PATH,
+                poppler_path=POPPLER_PATH
             )
             text = "\n".join(
                 pytesseract.image_to_string(img, lang=OCR_LANGUAGE)
@@ -57,35 +44,29 @@ def extract_text_from_pdf(uploaded_file) -> str:
             )
         except Exception as e:
             st.error(f"OCR failed: {e}")
-            return ""
 
     return text
 
 
-def extract_text_from_file(uploaded_file) -> str:
-    name = (uploaded_file.name or "").lower()
+def extract_text_from_file(uploaded_file):
+    name = uploaded_file.name.lower()
 
     if name.endswith(".pdf"):
         return extract_text_from_pdf(uploaded_file)
-
     if name.endswith(".txt"):
         return uploaded_file.getvalue().decode("utf-8", errors="ignore")
-
     if name.endswith(".docx"):
         from docx import Document
         doc = Document(uploaded_file)
         return "\n".join(p.text for p in doc.paragraphs)
-
     if name.endswith(".pptx"):
         from pptx import Presentation
         prs = Presentation(uploaded_file)
         out = []
         for slide in prs.slides:
             for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    t = (shape.text or "").strip()
-                    if t:
-                        out.append(t)
+                if hasattr(shape, "text") and shape.text.strip():
+                    out.append(shape.text.strip())
         return "\n".join(out)
-
     return ""
+
