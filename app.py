@@ -8,7 +8,7 @@ if str(ROOT) not in sys.path:
 import streamlit as st
 from ui_pages import render_pages
 
-st.set_page_config(page_title="CUI Inspector – Stable", layout="wide")
+st.set_page_config(page_title="CUI Inspector – Hotfix v3", layout="wide")
 
 def main():
     render_pages()
