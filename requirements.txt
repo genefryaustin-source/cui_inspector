@@ -1,4 +1,1 @@
-streamlit>=1.30
-pandas
-PyPDF2
-python-docx
+streamlit>=1.30\npandas\nreportlab\nPyPDF2\npython-docx\nopenpyxl\npython-pptx\nPillow\n

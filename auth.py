@@ -1,33 +1,23 @@
-import json
-import secrets
-import hashlib
+import json, hashlib
 import streamlit as st
-from db import db, now_iso
+from db import db, init_db, now_iso
 
-def pbkdf2_hash(password: str, iters: int = 200_000) -> str:
-    salt = secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), iters)
-    return f"pbkdf2_sha256${iters}${salt}${dk.hex()}"
+ROLES = ["superadmin","tenant_admin","analyst","viewer","auditor"]
 
-def pbkdf2_verify(password: str, stored: str) -> bool:
-    try:
-        algo, iters_s, salt, hexhash = stored.split("$", 3)
-        if algo != "pbkdf2_sha256":
-            return False
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), int(iters_s))
-        return dk.hex() == hexhash
-    except Exception:
-        return False
-
-def current_user():
-    return st.session_state.get("auth_user")
+def _hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
 
 def is_logged_in() -> bool:
-    return current_user() is not None
+    return bool(st.session_state.get("user"))
 
-def role() -> str:
-    u = current_user()
-    return u["role"] if u else ""
+def current_user():
+    return st.session_state.get("user")
+
+def tenant_id():
+    return st.session_state.get("tenant_id")
+
+def role():
+    return (current_user() or {}).get("role")
 
 def is_superadmin() -> bool:
     return role() == "superadmin"
@@ -38,113 +28,77 @@ def is_tenant_admin() -> bool:
 def is_auditor() -> bool:
     return role() == "auditor"
 
-def can_cross_tenant() -> bool:
+def can_select_any_tenant() -> bool:
     return is_superadmin() or is_auditor()
 
-def tenant_id():
-    return st.session_state.get("tenant_id")
-
-def set_tenant_id(tid):
-    st.session_state["tenant_id"] = tid
-
-def audit(event_type: str, details=None):
-    details = details or {}
-    u = current_user()
+def audit(event_type: str, payload=None):
+    init_db()
+    u = current_user() or {}
     with db() as con:
         con.execute(
-            "INSERT INTO audit_events (tenant_id, user_id, event_type, details_json, created_at) VALUES (?,?,?,?,?)",
-            (tenant_id(), u["id"] if u else None, event_type, json.dumps(details), now_iso()),
+            "INSERT INTO audit_events (tenant_id,user_id,event_type,event_json,created_at) VALUES (?,?,?,?,?)",
+            (tenant_id(), u.get("id"), event_type, json.dumps(payload or {}), now_iso()),
         )
+        con.commit()
 
-def render_superadmin_recovery_banner():
-    # Optional break-glass via Streamlit secrets (disable after use)
-    if st.secrets.get("SUPERADMIN_RECOVERY") != "ENABLED":
-        return
-    st.warning("⚠️ SuperAdmin Recovery Mode Enabled (disable after use)")
-    pw = st.text_input("Recovery password", type="password", key="recovery_pw")
-    if st.button("Recover SuperAdmin", key="recover_btn"):
-        if pw != st.secrets.get("SUPERADMIN_RECOVERY_PASSWORD"):
-            st.error("Invalid recovery password")
-            st.stop()
-        with db() as con:
-            r = con.execute("SELECT id FROM users WHERE role='superadmin' LIMIT 1").fetchone()
-            if r:
-                con.execute("UPDATE users SET password_hash=? WHERE role='superadmin'", (pbkdf2_hash(pw),))
-            else:
-                con.execute(
-                    "INSERT INTO users (tenant_id, username, password_hash, role, is_active, created_at) VALUES (NULL, ?, ?, 'superadmin', 1, ?)",
-                    ("superadmin", pbkdf2_hash(pw), now_iso()),
-                )
-        audit("superadmin_recovered", {})
-        st.success("SuperAdmin recovered. Remove recovery secrets and reload.")
-        st.stop()
+def _ensure_bootstrap_admin():
+    init_db()
+    with db() as con:
+        n = con.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+        if int(n) > 0:
+            return
+        con.execute("INSERT OR IGNORE INTO tenants (name,is_active,created_at) VALUES (?,?,?)", ("Default",1,now_iso()))
+        su_user = st.secrets.get("SUPERADMIN_USERNAME", "superadmin")
+        su_pw = st.secrets.get("SUPERADMIN_PASSWORD", "ChangeMeNow!123")
+        con.execute(
+            "INSERT INTO users (tenant_id,username,password_hash,role,is_active,created_at,last_login_at) VALUES (?,?,?,?,?,?,?)",
+            (None, su_user, _hash_pw(su_pw), "superadmin", 1, now_iso(), None),
+        )
+        con.commit()
 
 def render_login():
-    render_superadmin_recovery_banner()
+    init_db()
+    _ensure_bootstrap_admin()
 
     st.header("🔐 Sign in")
-    with db() as con:
-        user_count = int(con.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"])
+    with st.form("login_form"):
+        username = st.text_input("Username").strip()
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary")
 
-    if user_count == 0:
-        st.info("First run: create the initial SuperAdmin account.")
-        username = st.text_input("SuperAdmin username", value="superadmin").strip().lower()
-        password = st.text_input("SuperAdmin password", type="password")
-        confirm = st.text_input("Confirm password", type="password")
-        if st.button("Create SuperAdmin"):
-            if (not username) or (not password) or (password != confirm):
-                st.error("Provide a username and matching passwords.")
-                st.stop()
-            with db() as con:
-                con.execute(
-                    "INSERT INTO users (tenant_id, username, password_hash, role, is_active, created_at) VALUES (NULL, ?, ?, 'superadmin', 1, ?)",
-                    (username, pbkdf2_hash(password), now_iso()),
-                )
-            st.success("Created. Please sign in.")
+    if not submitted:
         return
 
-    username = st.text_input("Username").strip().lower()
-    password = st.text_input("Password", type="password")
+    with db() as con:
+        r = con.execute("SELECT * FROM users WHERE username=? AND is_active=1", (username,)).fetchone()
+        if (not r) or r["password_hash"] != _hash_pw(password):
+            st.error("Invalid credentials")
+            return
 
-    if st.button("Sign in"):
-        with db() as con:
-            r = con.execute(
-                "SELECT id, tenant_id, username, password_hash, role, is_active FROM users WHERE username=?",
-                (username,),
-            ).fetchone()
-            if (not r) or int(r["is_active"]) != 1 or (not pbkdf2_verify(password, r["password_hash"])):
-                st.error("Invalid credentials")
-                st.stop()
-
-            # last_login_at may not exist in legacy DBs; db.init_db() migrates it, but keep safe anyway
-            try:
-                con.execute("UPDATE users SET last_login_at=? WHERE id=?", (now_iso(), int(r["id"])))
-            except Exception:
-                pass
-
-        st.session_state["auth_user"] = {
-            "id": int(r["id"]),
-            "username": r["username"],
-            "role": r["role"],
-            "tenant_id": (int(r["tenant_id"]) if r["tenant_id"] is not None else None),
-        }
-
-        if can_cross_tenant():
-            set_tenant_id(None)
+        st.session_state["user"] = dict(r)
+        if r["role"] in ("tenant_admin","analyst","viewer"):
+            st.session_state["tenant_id"] = r["tenant_id"]
         else:
-            set_tenant_id(int(r["tenant_id"]) if r["tenant_id"] is not None else None)
+            st.session_state["tenant_id"] = None
 
-        audit("login_success", {"username": r["username"], "role": r["role"]})
-        st.success("Signed in")
-        st.rerun()
+        con.execute("UPDATE users SET last_login_at=? WHERE id=?", (now_iso(), int(r["id"])))
+        con.commit()
+
+    audit("login", {"username": username})
+    st.rerun()
 
 def render_logout_sidebar():
     u = current_user()
-    if not u:
-        return
-    st.sidebar.markdown(f"**Signed in:** {u['username']} ({u['role']})")
-    if st.sidebar.button("Sign out"):
-        audit("logout", {"username": u["username"]})
-        st.session_state.pop("auth_user", None)
+    st.sidebar.markdown("---")
+    if u:
+        st.sidebar.caption(f"Signed in as **{u.get('username')}** ({u.get('role')})")
+    if st.sidebar.button("Log out"):
+        st.session_state.pop("user", None)
         st.session_state.pop("tenant_id", None)
         st.rerun()
+
+def require_login() -> bool:
+    if not is_logged_in():
+        render_login()
+        return False
+    return True

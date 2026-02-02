@@ -1,81 +1,62 @@
 import streamlit as st
-from db import db, now_iso
-from auth import is_superadmin, can_cross_tenant, tenant_id, set_tenant_id, audit
+from db import db, init_db, now_iso
+from auth import is_superadmin, is_auditor, tenant_id, audit
 
-def ensure_default_tenant() -> int:
+def ensure_default_tenant():
+    init_db()
     with db() as con:
-        # COALESCE handles legacy rows/columns
-        try:
-            r = con.execute("SELECT id FROM tenants WHERE COALESCE(is_active,1)=1 ORDER BY id ASC LIMIT 1").fetchone()
-        except Exception:
-            r = con.execute("SELECT id FROM tenants ORDER BY id ASC LIMIT 1").fetchone()
-
+        r = con.execute("SELECT id FROM tenants WHERE is_active=1 ORDER BY id ASC LIMIT 1").fetchone()
         if r:
             return int(r["id"])
-
-        # Create default tenant
-        try:
-            con.execute("INSERT INTO tenants (name, created_at, is_active) VALUES (?, ?, 1)", ("default", now_iso()))
-        except Exception:
-            con.execute("INSERT INTO tenants (name, created_at) VALUES (?, ?)", ("default", now_iso()))
-        return int(con.execute("SELECT id FROM tenants WHERE name='default'").fetchone()["id"])
-
-def list_tenants(active_only: bool = True):
-    with db() as con:
-        if active_only:
-            try:
-                rows = con.execute("SELECT id, name FROM tenants WHERE COALESCE(is_active,1)=1 ORDER BY name").fetchall()
-            except Exception:
-                rows = con.execute("SELECT id, name FROM tenants ORDER BY name").fetchall()
-        else:
-            try:
-                rows = con.execute("SELECT id, name, is_active, created_at FROM tenants ORDER BY name").fetchall()
-            except Exception:
-                rows = con.execute("SELECT id, name, created_at FROM tenants ORDER BY name").fetchall()
-    return [dict(r) for r in rows]
+        con.execute("INSERT INTO tenants (name,is_active,created_at) VALUES (?,?,?)", ("Default",1,now_iso()))
+        con.commit()
+        return int(con.execute("SELECT id FROM tenants WHERE name='Default'").fetchone()["id"])
 
 def render_tenant_selector_sidebar():
-    ensure_default_tenant()
-    tenants = list_tenants(active_only=True)
-    if not tenants:
+    init_db()
+    if tenant_id() is None and not (is_superadmin() or is_auditor()):
         return
 
-    if can_cross_tenant():
-        opts = {t["name"]: int(t["id"]) for t in tenants}
-        if tenant_id() is None:
-            set_tenant_id(list(opts.values())[0])
-        inv = {v: k for k, v in opts.items()}
-        cur_name = inv.get(tenant_id(), list(opts.keys())[0])
-        choice = st.sidebar.selectbox("Tenant", options=list(opts.keys()), index=list(opts.keys()).index(cur_name))
-        set_tenant_id(opts[choice])
-    else:
-        tid = tenant_id()
-        if tid is None:
-            set_tenant_id(ensure_default_tenant())
-            tid = tenant_id()
-        tname = next((t["name"] for t in tenants if int(t["id"]) == int(tid)), "default")
-        st.sidebar.markdown(f"**Tenant:** {tname}")
+    with db() as con:
+        tenants = con.execute("SELECT id,name FROM tenants WHERE is_active=1 ORDER BY name").fetchall()
+
+    if not tenants:
+        ensure_default_tenant()
+        with db() as con:
+            tenants = con.execute("SELECT id,name FROM tenants WHERE is_active=1 ORDER BY name").fetchall()
+
+    opts = {f"{t['name']} (#{t['id']})": int(t["id"]) for t in tenants}
+    labels = list(opts.keys())
+    current = st.session_state.get("tenant_id")
+    idx = 0
+    if current:
+        for i, lab in enumerate(labels):
+            if opts[lab] == int(current):
+                idx = i
+                break
+
+    st.sidebar.markdown("### Tenant")
+    choice = st.sidebar.selectbox("Tenant", labels, index=idx)
+    st.session_state["tenant_id"] = opts[choice]
 
 def render_superadmin_tenant_management():
-    st.header("🛡️ SuperAdmin – Tenant Management")
+    st.header("🛡️ Tenant Management (SuperAdmin)")
     if not is_superadmin():
         st.error("SuperAdmin only.")
         return
+    init_db()
+    with db() as con:
+        tenants = con.execute("SELECT id,name,is_active,created_at FROM tenants ORDER BY id").fetchall()
+    st.dataframe([dict(t) for t in tenants], use_container_width=True)
 
     st.subheader("Create tenant")
-    with st.form("create_tenant"):
-        name = st.text_input("Tenant name (unique)").strip().lower()
-        submitted = st.form_submit_button("Create tenant")
-    if submitted:
+    name = st.text_input("Tenant name").strip()
+    if st.button("Create tenant", type="primary"):
         if not name:
-            st.error("Tenant name required.")
-        else:
-            with db() as con:
-                con.execute("INSERT INTO tenants (name, created_at, is_active) VALUES (?, ?, 1)", (name, now_iso()))
-            audit("tenant_create", {"name": name})
-            st.success("Tenant created.")
-            st.rerun()
-
-    st.divider()
-    st.subheader("Tenants")
-    st.dataframe(list_tenants(active_only=False), use_container_width=True)
+            st.error("Name required.")
+            return
+        with db() as con:
+            con.execute("INSERT OR IGNORE INTO tenants (name,is_active,created_at) VALUES (?,?,?)", (name,1,now_iso()))
+            con.commit()
+        audit("tenant_created", {"name": name})
+        st.rerun()
