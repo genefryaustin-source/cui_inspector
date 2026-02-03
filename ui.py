@@ -1,4 +1,13 @@
+import sys
+from pathlib import Path
 import streamlit as st
+
+# -------------------------------------------------
+# Ensure local sibling modules resolve (CRITICAL)
+# -------------------------------------------------
+ROOT = Path(__file__).parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from db import init_db
 from auth import render_login, require_login, logout
@@ -88,6 +97,7 @@ def render_app():
 
     else:
         st.info("Select a page from the sidebar.")
+
 
 
 
